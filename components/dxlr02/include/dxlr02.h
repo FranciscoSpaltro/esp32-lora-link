@@ -4,6 +4,23 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stddef.h>
+#include "esp_timer.h"
+
+
+// --- CONFIGURACIÓN DEBUG (UART 1 REMAPEADA) ---
+// NO USAR PINES 9 o 10 (Crashea la flash)
+// NO USAR PINES 15 (Tu sensor)
+#define DEBUG_PORT      UART_NUM_1  
+#define DEBUG_TX_PIN    4   // <--- Conectá el Analizador/RX acá
+#define DEBUG_RX_PIN    5   // <--- No es necesario si solo enviás logs
+#define DEBUG_BAUD      115200
+
+void debug_print(const char* str);
+
+#define MAX_BUFFER_LEN 50
+#define TIMEOUT_ONE_BYTE_MS 500
+#define TIMEOUT_READ_US 10000
+
 
 typedef enum {
     DXLR02_OK = 0,
@@ -14,6 +31,7 @@ typedef enum {
     DXLR02_ERR_MODULE_NOT_RESPONDING,
     DXLR02_ERR_INVALID_PARAMETER,
     DXLR02_ERR_ALREADY_INIT,
+    DXLR02_ERR_OUT_OF_SPACE,
     DXLR02_ERR_COUNT                        // do not use
 } dxlr02_status_t;
 
@@ -43,7 +61,7 @@ typedef struct {
 
 
 dxlr02_status_t dxlr02_init(dxlr02_t * module, uint8_t port, int baudrate);
-
+dxlr02_status_t dxlr02_ensure_data_mode(dxlr02_t* module);
 dxlr02_status_t dxlr02_set_config(dxlr02_t * module, const dxlr02_config_t * conf);
 dxlr02_status_t dxlr02_get_config(dxlr02_t * module, dxlr02_config_t * conf);
 

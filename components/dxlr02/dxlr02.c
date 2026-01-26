@@ -1,6 +1,22 @@
 #include "dxlr02.h"
 #include "driver/uart.h"
 #include "string.h"
+#include <stdio.h>
+#include "driver/gpio.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+void debug(int a) {
+    for(int i = 0; i < a; i++){
+        gpio_set_level(21, 1); // Prende LED (Significa "Llegué a AT")
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(21, 0); // Apaga
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    vTaskDelay(pdMS_TO_TICKS(500));
+}
+
+
 
 /****************************************** AUXILIAR UART FUNCTIONS ******************************************/
 static dxlr02_status_t dxlr02_uart_send(dxlr02_t *module, const char *data, size_t len) {
@@ -17,120 +33,132 @@ static dxlr02_status_t dxlr02_uart_send(dxlr02_t *module, const char *data, size
     return DXLR02_OK;
 }
 
-static dxlr02_status_t dxlr02_uart_read(dxlr02_t *module, char *data, size_t len, size_t * read){
-    if(!module || !module -> initialized)
-        return DXLR02_ERR_NOT_INITIALIZED;
-
-    *read = uart_read_bytes((uart_port_t) module -> uart_port, data, len, pdMS_TO_TICKS(500));
-
-    if(*read == 0){
-        return DXLR02_ERR_TIMEOUT;  // revisar
-    } else if (*read < 0) {
-        return DXLR02_ERR_UART;
-    } else if (*read != len){
-        return DXLR02_ERR_INVALID_RESPONSE; // revisar
-    }
-
-    return DXLR02_OK;
-}
-
-static dxlr02_status_t dxlr02_read_exact(dxlr02_t *module, const char *expected, size_t len, uint32_t timeout_ms){
+static dxlr02_status_t dxlr02_read_until(dxlr02_t *module, char * response, size_t response_len, char delim, size_t times, uint32_t timeout_ms){
     if(!module || !module->initialized)
         return DXLR02_ERR_NOT_INITIALIZED;
 
-    char data[len];
-    int read = uart_read_bytes((uart_port_t) module -> uart_port, data, len, pdMS_TO_TICKS(timeout_ms));
+    size_t i = 0, j = 0;
+    response[0] = '\0';
+    int64_t init_time = esp_timer_get_time();
+    int64_t timeout_us = (int64_t)timeout_ms * 1000;
+    bool delim_found = false;
+    for(j = 0; j < times; j++){
+        delim_found = false;
+        
+        while(i < response_len - 1){
+            if(esp_timer_get_time() - init_time > timeout_us){
+                return DXLR02_ERR_TIMEOUT;
+            }
 
-    if(read != len)
+            int read = uart_read_bytes((uart_port_t) module -> uart_port, response + i, 1, pdMS_TO_TICKS(TIMEOUT_ONE_BYTE_MS));
+
+            if(read < 0){
+                return DXLR02_ERR_UART;
+            }
+            else if(read == 0){
+                continue;
+            }
+            if(response[i] == delim){
+                
+                i++;
+                delim_found = true;
+                break;
+            } 
+
+            i++;
+        }
+
+        if(!delim_found){
+            response[i] = '\0';
+            return DXLR02_ERR_INVALID_RESPONSE;
+        }
+    }
+
+    if(response[0] == '\0'){
         return DXLR02_ERR_INVALID_RESPONSE;
+    }
 
-    size_t i = 0;
-    while (i < len && data[i] == expected[i]) 
-        i++;
+    response[i] = '\0';
+    if(j == times){
+        return DXLR02_OK;
+    }
 
-
-    if(i != len)
-        return DXLR02_ERR_INVALID_RESPONSE;
-
-    return DXLR02_OK;
+    return DXLR02_ERR_INVALID_RESPONSE;
 }
 
-dxlr02_status_t dxlr02_send_cmd(dxlr02_t * module, const char * cmd, const char * response){
+dxlr02_status_t dxlr02_send_cmd(dxlr02_t * module, const char * cmd){
     if(!module || !module->initialized){
         return DXLR02_ERR_NOT_INITIALIZED;
     }
     
     uart_flush_input((uart_port_t)module->uart_port);
     
-    dxlr02_status_t st = dxlr02_uart_send(module, cmd, strlen(cmd));
-    if(st != DXLR02_OK)
-        return st;
-
-    return dxlr02_read_exact(module, response, strlen(response), 500);
- 
+    return dxlr02_uart_send(module, cmd, strlen(cmd)); 
 }
 
 /****************************************** AUXILIAR FUNCTIONS ******************************************/
-static dxlr02_status_t dxlr02_ensure_at(dxlr02_t* module){
-    dxlr02_status_t st;
-    st = dxlr02_AT_mode(module);
-    if(st != DXLR02_OK)
-        return st;
 
-    if(!module->mode_AT){
-        st = dxlr02_AT_mode(module);
-        if(st != DXLR02_OK)
-            return st;
-    }
+static dxlr02_status_t dxlr02_AT_mode(dxlr02_t * module){ 
+    dxlr02_status_t st; 
+    char response[25]; 
+    st = dxlr02_send_cmd(module, "+++\r\n");
+    if(st != DXLR02_OK) 
+        return st; 
 
-    return DXLR02_OK;
-}
-
-static dxlr02_status_t dxlr02_ensure_data_mode(dxlr02_t* module){
-    dxlr02_status_t st;
-    st = dxlr02_AT_mode(module);
-    if(st != DXLR02_OK)
-        return st;
-
-    if(module->mode_AT){
-        st = dxlr02_AT_mode(module);
-        if(st != DXLR02_OK)
-            return st;
-    }
-
-    return DXLR02_OK;
-}
-
-dxlr02_status_t dxlr02_AT_mode(dxlr02_t * module){
-    const char *msg = "+++\r\n";
-    dxlr02_status_t st;
-    char response[25];
-    bool out;
-
-    st = dxlr02_uart_send(module, msg, strlen(msg));
-    if(st != DXLR02_OK)
-        return st;
-
-    size_t read;
-    st = dxlr02_uart_read(module, response, 24, &read);
-    if(st != DXLR02_OK)
-        return st;
-
-    response[read] = '\0';
-
-    if(strcmp(response, "Entry AT\r\n") == 0){
-        out = true;
-    }
-    else if(strcmp(response, "Exit AT\r\nPower on\r\n") == 0){
-        out = false;
-    }
-    else{
-        return DXLR02_ERR_INVALID_RESPONSE;
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, pdMS_TO_TICKS(500)); 
+    
+    if(st != DXLR02_OK) 
+        return st; 
+    
+    if(strcmp(response, "Entry AT\r\n") == 0){ 
+        module -> mode_AT = true; 
+        return DXLR02_OK; 
+    } else if(strcmp(response, "Exit AT\r\n") == 0){ 
+        st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, pdMS_TO_TICKS(500)); 
+        if(st != DXLR02_OK) 
+        return st; 
+        
+        if(strcmp(response, "Power On\r\n") == 0 || strcmp(response, "Power on\r\n") == 0){
+            module -> mode_AT = false; 
+            return DXLR02_OK; 
+        } 
     } 
-
-    module -> mode_AT = out;
-    return DXLR02_OK;
+    
+    return DXLR02_ERR_INVALID_RESPONSE; 
 }
+
+dxlr02_status_t dxlr02_ensure_at(dxlr02_t* module){ 
+    dxlr02_status_t st; 
+    st = dxlr02_AT_mode(module); 
+    if(st != DXLR02_OK){
+        return st; 
+    }
+    if(!module->mode_AT){ 
+        st = dxlr02_AT_mode(module); 
+        if(st != DXLR02_OK) {
+            return st; 
+        }  
+    } 
+    return DXLR02_OK; 
+} 
+
+dxlr02_status_t dxlr02_ensure_data_mode(dxlr02_t* module){ 
+    dxlr02_status_t st; 
+    st = dxlr02_AT_mode(module); 
+    if(st != DXLR02_OK) 
+        return st; 
+    
+    if(module->mode_AT){ 
+        st = dxlr02_AT_mode(module); 
+        if(st != DXLR02_OK) 
+            return st; 
+    } 
+    
+    return DXLR02_OK; 
+} 
+
+
+
 
 dxlr02_status_t dxlr02_set_baudrate(dxlr02_t * module, int baudrate){
     dxlr02_status_t st = dxlr02_ensure_at(module);
@@ -139,39 +167,39 @@ dxlr02_status_t dxlr02_set_baudrate(dxlr02_t * module, int baudrate){
 
     switch(baudrate){
         case 1200:
-            st = dxlr02_send_cmd(module, "AT+BAUD1\r\n", "OK\r\n");
-            break;
+        st = dxlr02_send_cmd(module, "AT+BAUD1\r\n");
+        break;
 
         case 2400:
-            st = dxlr02_send_cmd(module, "AT+BAUD2\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD2\r\n");
             break;
 
         case 4800:
-            st = dxlr02_send_cmd(module, "AT+BAUD3\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD3\r\n");
             break;
 
         case 9600:
-            st = dxlr02_send_cmd(module, "AT+BAUD4\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD4\r\n");
             break;
 
         case 19200:
-            st = dxlr02_send_cmd(module, "AT+BAUD5\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD5\r\n");
             break;
 
         case 38400:
-            st = dxlr02_send_cmd(module, "AT+BAUD6\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD6\r\n");
             break;
 
         case 57600:
-            st = dxlr02_send_cmd(module, "AT+BAUD7\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD7\r\n");
             break;
 
         case 115200:
-            st = dxlr02_send_cmd(module, "AT+BAUD8\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD8\r\n");
             break;
 
         case 128000:
-            st = dxlr02_send_cmd(module, "AT+BAUD9\r\n", "OK\r\n");
+            st = dxlr02_send_cmd(module, "AT+BAUD9\r\n");
             break;
 
         default:
@@ -179,9 +207,16 @@ dxlr02_status_t dxlr02_set_baudrate(dxlr02_t * module, int baudrate){
             break;
     }
 
-    
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     st = dxlr02_ensure_data_mode(module);
     if(st != DXLR02_OK)
@@ -202,12 +237,21 @@ dxlr02_status_t dxlr02_set_mode(dxlr02_t * module, uint8_t mode){
     char cmd[12];
     snprintf(cmd, sizeof(cmd), "AT+MODE%u\r\n", mode);
 
-    char response[14];
-    snprintf(response, sizeof(response), "+MODE=%u\r\nOK\r\n", mode);
+    char expected_response[14];
+    snprintf(expected_response, sizeof(expected_response), "+MODE=%u\r\nOK\r\n", mode);
 
-    st = dxlr02_send_cmd(module, cmd, response);
+    char response[14];
+
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, expected_response) != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.working_mode = mode;
 
@@ -230,9 +274,17 @@ dxlr02_status_t dxlr02_set_energy_mode(dxlr02_t * module, uint8_t mode){
     char cmd[13];
     snprintf(cmd, sizeof(cmd), "AT+SLEEP%u\r\n", mode);
 
-    st = dxlr02_send_cmd(module, cmd, "OK\r\n");
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.energy_mode = mode;
 
@@ -255,9 +307,17 @@ dxlr02_status_t dxlr02_set_stop_bit(dxlr02_t * module, uint8_t stop){       // s
     char cmd[12];
     snprintf(cmd, sizeof(cmd), "AT+STOP%u\r\n", stop);
 
-    st = dxlr02_send_cmd(module, cmd, "OK\r\n");
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.stop_bit = stop;
 
@@ -280,9 +340,17 @@ dxlr02_status_t dxlr02_set_parity(dxlr02_t * module, uint8_t parity){
     char cmd[12];
     snprintf(cmd, sizeof(cmd), "AT+PARI%u\r\n", parity);
 
-    st = dxlr02_send_cmd(module, cmd, "OK\r\n");
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.parity = parity;
 
@@ -298,9 +366,17 @@ dxlr02_status_t dxlr02_reset(dxlr02_t * module){
     if(st != DXLR02_OK)
         return st;
 
-    st = dxlr02_send_cmd(module, "AT+RESET", "OK\r\nPower On\r\n");
+    st = dxlr02_send_cmd(module, "AT+RESET\r\n");
     if(st != DXLR02_OK)
         return st;
+
+    char response[15];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\nPower On\r\n") != 0 && strcmp(response, "OK\r\nPower on\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     st = dxlr02_ensure_data_mode(module);
     if(st != DXLR02_OK)
@@ -311,14 +387,23 @@ dxlr02_status_t dxlr02_reset(dxlr02_t * module){
 
 dxlr02_status_t dxlr02_set_default(dxlr02_t * module){
     dxlr02_status_t st = dxlr02_ensure_at(module);
+    if(st != DXLR02_OK){
+        return st;
+    }
+
+    st = dxlr02_send_cmd(module, "AT+DEFAULT\r\n");
     if(st != DXLR02_OK)
         return st;
 
-    st = dxlr02_send_cmd(module, "AT+DEFAULT", "OK\r\nPower On\r\n");
+    char response[15];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
     if(st != DXLR02_OK)
         return st;
 
-    module->config.address = 0xffff;
+    if(strcmp(response, "OK\r\nPower On\r\n") != 0 && strcmp(response, "OK\r\nPower on\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
+
+    module->config.address = 0xff;
     module->config.baudrate = 9600;
     module->config.channel = 0;
     module->config.crc = false;
@@ -351,9 +436,17 @@ dxlr02_status_t dxlr02_set_level(dxlr02_t * module, uint8_t level){
     char cmd[13];
     snprintf(cmd, sizeof(cmd), "AT+LEVEL%u\r\n", level);
 
-    st = dxlr02_send_cmd(module, cmd, "OK\r\n");
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.rate_level = level;
 
@@ -373,16 +466,24 @@ dxlr02_status_t dxlr02_set_channel(dxlr02_t * module, uint8_t ch){
     if(st != DXLR02_OK)
         return st;
 
-    char cmd[16];
+    char cmd[20];
     snprintf(cmd, sizeof(cmd), "AT+CHANNEL%02X\r\n", ch);
 
-    char response[19];
-    snprintf(response, sizeof(response), "+CHANNEL=%02X\r\nOK\r\n", ch);
+    char expected_response[20];
+    snprintf(expected_response, sizeof(expected_response), "+CHANNEL=%02X\r\nOK\r\n", ch);
  
-    st = dxlr02_send_cmd(module, cmd, response);
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
 
+    char response[20];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, expected_response) != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
+        
     module->config.channel = ch;
 
     st = dxlr02_ensure_data_mode(module);
@@ -403,14 +504,22 @@ dxlr02_status_t dxlr02_set_mac(dxlr02_t * module, uint8_t mac){
     snprintf(high, sizeof(high), "%02X", (mac >> 4) & 0xFF);
     snprintf(low, sizeof(low), "%02X", mac & 0xFF);
 
-    char cmd[14];
+    char cmd[20];
     snprintf(cmd, sizeof(cmd), "AT+MAC%s,%s\r\n", high, low);
-    char response[16];
-    snprintf(response, sizeof(response), "+MAC=%s%s\r\nOK\r\n", high, low);
+    char expected_response[20];
+    snprintf(expected_response, sizeof(expected_response), "+MAC=%s%s\r\nOK\r\n", high, low);
 
-    st = dxlr02_send_cmd(module, cmd, response);
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[20];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, expected_response) != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.address = mac;
 
@@ -431,17 +540,25 @@ dxlr02_status_t dxlr02_set_transmit_power(dxlr02_t * module, uint8_t pow){
     if(st != DXLR02_OK)
         return st;
 
-    char cmd[12];
+    char cmd[20];
     snprintf(cmd, sizeof(cmd), "AT+POWE%u\r\n", pow);
 
-    char response[15];
-    snprintf(response, sizeof(response), "+POWE=%u\r\nOK\r\n", pow);
+    char expected_response[20];
+    snprintf(expected_response, sizeof(expected_response), "+POWE=%u\r\nOK\r\n", pow);
 
-    st = dxlr02_send_cmd(module, cmd, response);
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
 
     module->config.transmit_power = pow;
+
+    char response[20];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, expected_response) != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     st = dxlr02_ensure_data_mode(module);
     if(st != DXLR02_OK)
@@ -461,12 +578,20 @@ dxlr02_status_t dxlr02_set_coding_rate(dxlr02_t * module, uint8_t four_of_x){ //
     char cmd[10];
     snprintf(cmd, sizeof(cmd), "AT+CR%u\r\n", four_of_x - 4);
 
-    char response[12];
-    snprintf(response, sizeof(response), "+CR=%u\r\nOK\r\n", four_of_x - 4);
+    char expected_response[20];
+    snprintf(expected_response, sizeof(expected_response), "+CR=%u\r\nOK\r\n", four_of_x - 4);
 
-    st = dxlr02_send_cmd(module, cmd, response);
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[20];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, expected_response) != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.rf_coding_rate = four_of_x;
 
@@ -490,12 +615,20 @@ dxlr02_status_t dxlr02_set_spread_factor(dxlr02_t * module, uint8_t sf){
     char cmd[10];
     snprintf(cmd, sizeof(cmd), "AT+SF%u\r\n", sf);
 
-    char response[13];
-    snprintf(response, sizeof(response), "+SF=%u\r\nOK\r\n", sf);
+    char expected_response[20];
+    snprintf(expected_response, sizeof(expected_response), "+SF=%u\r\nOK\r\n", sf);
 
-    st = dxlr02_send_cmd(module, cmd, response);
+    st = dxlr02_send_cmd(module, cmd);
     if(st != DXLR02_OK)
         return st;
+
+    char response[20];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 2, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, expected_response) != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.spread_factor = sf;
 
@@ -512,13 +645,21 @@ dxlr02_status_t dxlr02_set_crc(dxlr02_t * module, bool crc){
         return st;
 
     if(crc){
-        st = dxlr02_send_cmd(module, "AT+CRC1\r\n", "OK\r\n");
+        st = dxlr02_send_cmd(module, "AT+CRC1\r\n");
     } else {
-        st = dxlr02_send_cmd(module, "AT+CRC0\r\n", "OK\r\n");
+        st = dxlr02_send_cmd(module, "AT+CRC0\r\n");
     }
 
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.crc = crc;
 
@@ -535,13 +676,21 @@ dxlr02_status_t dxlr02_set_iq_flip(dxlr02_t * module, bool flip){
         return st;
 
     if(flip){
-        st = dxlr02_send_cmd(module, "AT+IQ1\r\n", "OK\r\n");
+        st = dxlr02_send_cmd(module, "AT+IQ1\r\n");
     } else {
-        st = dxlr02_send_cmd(module, "AT+IQ0\r\n", "OK\r\n");
+        st = dxlr02_send_cmd(module, "AT+IQ0\r\n");
     }
 
     if(st != DXLR02_OK)
         return st;
+
+    char response[5];
+    st = dxlr02_read_until(module, response, sizeof(response), '\n', 1, 500);
+    if(st != DXLR02_OK)
+        return st;
+
+    if(strcmp(response, "OK\r\n") != 0)
+        return DXLR02_ERR_INVALID_RESPONSE;
 
     module->config.iq_signal_flip = flip;
 
@@ -557,21 +706,25 @@ dxlr02_status_t dxlr02_set_iq_flip(dxlr02_t * module, bool flip){
 dxlr02_status_t dxlr02_init(dxlr02_t * module, uint8_t port, int baudrate){
     if(!module)
         return DXLR02_ERR_INVALID_PARAMETER;
-
     if(module -> initialized)
         return DXLR02_ERR_ALREADY_INIT;
-
     module -> uart_port = port;
     module -> mode_AT = false;
 
+    module -> initialized = true;
+
     dxlr02_status_t st = dxlr02_set_default(module); 
-    if(st != DXLR02_OK)
+    if(st != DXLR02_OK){
+        module -> initialized = false;
         return st;
+    }
 
     st = dxlr02_set_baudrate(module, baudrate);
-    if(st != DXLR02_OK)
+    if(st != DXLR02_OK){
+        module -> initialized = false;
         return st;
-        
+    }
+
     module -> config.baudrate = baudrate;
     
     return DXLR02_OK;
@@ -659,12 +812,63 @@ dxlr02_status_t dxlr02_set_config(dxlr02_t * module, const dxlr02_config_t * con
 
 dxlr02_status_t dxlr02_get_config(dxlr02_t * module, dxlr02_config_t * conf){
     // TO DO
+    return DXLR02_OK;
 }
 
-dxlr02_status_t dxlr02_send_data(dxlr02_t * module, const char * data, size_t size){
-    // TO DO
+dxlr02_status_t dxlr02_send_data(dxlr02_t *module, const char *data, size_t size){
+    // En el flujo del programa se debe estar en data_mode, es responsabilidad de quien llama a esta función
+    // Las cadenas se envian con un \0
+
+    if(!module || !module->initialized)
+        return DXLR02_ERR_NOT_INITIALIZED;
+    if(!data || size == 0)
+        return DXLR02_ERR_INVALID_PARAMETER;
+
+    if (data[size - 1] == '\0')
+        return dxlr02_uart_send(module, data, size);
+
+    char aux[size + 1];
+    memcpy(aux, data, size);
+    aux[size] = '\0';
+    return dxlr02_uart_send(module, aux, size + 1);
 }
+
 
 dxlr02_status_t dxlr02_receive_data(dxlr02_t * module, char * data, size_t max_size, size_t * eff_len){
-    // TO DO
+    // En el flujo del programa se debe estar en data_mode, es responsabilidad de quien llama a esta función
+    // Asume que las cadenas se envian con un \0
+
+    if(!module || !module->initialized)
+        return DXLR02_ERR_NOT_INITIALIZED;
+
+    if(!data || max_size == 0)
+        return DXLR02_ERR_INVALID_PARAMETER;
+
+    size_t i = 0;
+    data[0] = '\0';
+    int64_t init_time = esp_timer_get_time();
+    int64_t timeout_us = (int64_t)TIMEOUT_READ_US;
+
+    while(i < max_size - 1){
+        if(esp_timer_get_time() - init_time > timeout_us)
+            return DXLR02_ERR_TIMEOUT;
+
+        int read = uart_read_bytes((uart_port_t) module -> uart_port, data + i, 1, pdMS_TO_TICKS(TIMEOUT_ONE_BYTE_MS));
+
+        if(read < 0)
+            return DXLR02_ERR_UART;
+        else if(read == 0)
+            continue;
+
+        if(data[i] == '\0'){
+            return DXLR02_OK;
+        } 
+
+        i++;
+    }
+
+    data[max_size - 1] = '\0';
+    
+    return DXLR02_ERR_OUT_OF_SPACE;
+
 }
